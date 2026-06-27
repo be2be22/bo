@@ -2,15 +2,19 @@ import { Bot } from "grammy";
 import * as fs from "fs";
 import * as path from "path";
 import * as dotenv from "dotenv";
-import * as https from "https";
+
+import { formatProgress, formatInitialProgress, makeThrottledProgress } from "./progress";
+import { pixeldrainService } from "./uploaders/pixeldrain";
+import { gofileService } from "./uploaders/gofile";
+import { storageToService } from "./uploaders/storageto";
+import { UploaderService } from "./types";
 
 dotenv.config();
 
 const {
   TELEGRAM_BOT_TOKEN,
   TELEGRAM_BOT_API_URL = "http://localhost:8081",
-  LOCAL_FILES_DIR = "/tmp/telegram-bot-api",
-  PIXELDRAIN_API_KEY
+  LOCAL_FILES_DIR = "/tmp/telegram-bot-api"
 } = process.env;
 
 if (!TELEGRAM_BOT_TOKEN) {
@@ -21,6 +25,9 @@ if (!TELEGRAM_BOT_TOKEN) {
 const bot = new Bot(TELEGRAM_BOT_TOKEN, {
   client: { apiRoot: TELEGRAM_BOT_API_URL }
 });
+
+// All upload destinations the bot will try, in order.
+const services: UploaderService[] = [pixeldrainService, gofileService, storageToService];
 
 function getFileDetails(ctx: any) {
   const message = ctx.message;
@@ -36,101 +43,53 @@ function getFileDetails(ctx: any) {
   return null;
 }
 
-type ProgressCallback = (uploadedBytes: number, totalBytes: number, speedBps: number) => void;
-
-function formatProgress(uploaded: number, total: number, speedBps: number): string {
-  const percent = Math.min(100, Math.round((uploaded / total) * 100));
-  const filled = Math.round(percent / 5);
-  const bar = "▓".repeat(filled) + "░".repeat(20 - filled);
-
-  const uploadedMB = (uploaded / (1024 * 1024)).toFixed(1);
-  const totalMB   = (total   / (1024 * 1024)).toFixed(1);
-  const speedMBps = (speedBps / (1024 * 1024)).toFixed(1);
-
-  const remainingSecs = speedBps > 0 ? (total - uploaded) / speedBps : 0;
-  const timeStr = remainingSecs > 60
-    ? `${Math.round(remainingSecs / 60)} دقیقه`
-    : `${Math.round(remainingSecs)} ثانیه`;
-
-  return (
-    `📤 در حال آپلود به پیکسل‌درین...\n\n` +
-    `[${bar}] ${percent}%\n` +
-    `📊 ${uploadedMB} / ${totalMB} MB\n` +
-    `⚡ سرعت: ${speedMBps} MB/s\n` +
-    `⏱ زمان باقیمانده: ~${timeStr}`
-  );
-}
-
-function uploadToPixeldrain(
-  filePath: string,
-  fileName: string,
-  totalBytes: number,
-  onProgress?: ProgressCallback
-): Promise<string> {
+/**
+ * The local Telegram Bot API server starts pulling the file from Telegram's
+ * servers as soon as the message arrives - it writes directly to disk at
+ * LOCAL_FILES_DIR as bytes come in, growing the file in place. By the time we
+ * call getFile() it may already be fully downloaded (small/medium files), or
+ * still in progress (large files, slow links). Either way, polling the on-disk
+ * file size gives us a real, accurate progress readout instead of a frozen
+ * "در حال دریافت..." message - no need to re-download anything ourselves.
+ */
+function waitForLocalFileWithProgress(absoluteFilePath: string, totalBytes: number, onProgress?: (uploaded: number, total: number, speedBps: number) => void): Promise<void> {
   return new Promise((resolve, reject) => {
-    const encodedFileName = encodeURIComponent(fileName);
-    const parsedUrl = new URL(`https://pixeldrain.com/api/file/${encodedFileName}`);
-
-    const headers: Record<string, string> = {
-      "User-Agent": "telegram-uploader-bot/1.0",
-      "Content-Length": totalBytes.toString()
-    };
-
-    if (PIXELDRAIN_API_KEY) {
-      const auth = Buffer.from(`:${PIXELDRAIN_API_KEY}`).toString("base64");
-      headers["Authorization"] = `Basic ${auth}`;
-    }
-
-    const options: https.RequestOptions = {
-      method: "PUT",
-      hostname: parsedUrl.hostname,
-      path: parsedUrl.pathname,
-      headers
-    };
-
-    const req = https.request(options, (res) => {
-      let body = "";
-      res.on("data", (chunk) => { body += chunk; });
-      res.on("end", () => {
-        try {
-          const parsed = JSON.parse(body);
-          if ((res.statusCode === 200 || res.statusCode === 201) && parsed.id) {
-            resolve(`https://pixeldrain.com/u/${parsed.id}`);
-          } else {
-            reject(new Error(parsed.message || `آپلود ناموفق بود: ${body}`));
-          }
-        } catch (err: any) {
-          reject(new Error(`خطا در پردازش پاسخ پیکسل‌درین: ${err.message}`));
-        }
-      });
-    });
-
-    req.on("error", (err) => reject(err));
-
-    // ── Progress tracking ──────────────────────────────────────────────────
-    let uploadedBytes = 0;
     const startTime = Date.now();
+    let settled = false;
 
-    const fileStream = fs.createReadStream(filePath);
+    const finish = (err?: Error) => {
+      if (settled) return;
+      settled = true;
+      clearInterval(interval);
+      err ? reject(err) : resolve();
+    };
 
-    fileStream.on("data", (chunk) => {
-      uploadedBytes += Buffer.isBuffer(chunk) ? chunk.length : Buffer.byteLength(chunk as string);
-      if (onProgress) {
-        const elapsed = (Date.now() - startTime) / 1000;
-        const speedBps = elapsed > 0.1 ? uploadedBytes / elapsed : 0;
-        onProgress(uploadedBytes, totalBytes, speedBps);
+    const interval = setInterval(() => {
+      try {
+        if (!fs.existsSync(absoluteFilePath)) return;
+        const size = fs.statSync(absoluteFilePath).size;
+        if (onProgress) {
+          const elapsed = (Date.now() - startTime) / 1000;
+          const speedBps = elapsed > 0.1 ? size / elapsed : 0;
+          onProgress(size, totalBytes, speedBps);
+        }
+        if (size >= totalBytes) finish();
+      } catch (err: any) {
+        finish(err);
       }
-    });
+    }, 400);
 
-    fileStream.on("error", (err) => { req.destroy(); reject(err); });
-    fileStream.pipe(req);
+    // Safety timeout: if the file never reaches full size, don't hang forever.
+    setTimeout(() => finish(), 10 * 60 * 1000);
   });
 }
 
 // ── /start ────────────────────────────────────────────────────────────────
 bot.command("start", async (ctx) => {
+  const serviceList = services.map((s) => `${s.emoji} ${s.label}`).join("، ");
   await ctx.reply(
-    "سلام! فایل، ویدیو یا عکسی که میخوای رو برام بفرست تا مستقیم توی پیکسل‌درین آپلود کنم و لینک دانلود بدم.\n" +
+    "سلام! فایل، ویدیو یا عکسی که میخوای رو برام بفرست تا مستقیم توی چند هاست مختلف آپلود کنم و لینک‌های دانلود مستقیم بدم.\n\n" +
+    `📡 سرویس‌های فعال: ${serviceList}\n\n` +
     "این ربات از فایل‌های تا سقف ۲ گیگابایت پشتیبانی می‌کنه! 🚀"
   );
 });
@@ -140,54 +99,102 @@ bot.on([":document", ":photo", ":video", ":audio", ":voice", ":video_note", ":an
   const fileDetails = getFileDetails(ctx);
   if (!fileDetails) return ctx.reply("متاسفانه قادر به خواندن جزئیات فایل دریافتی نیستم.");
 
-  const { fileId, fileName } = fileDetails;
+  const { fileId, fileName, mimeType } = fileDetails;
   const statusMsg = await ctx.reply(`در حال دریافت فایل "${fileName}" از تلگرام... ⏳`);
+
+  let absoluteFilePath: string | null = null;
 
   try {
     const fileObj = await bot.api.getFile(fileId);
     if (!fileObj.file_path) throw new Error("مسیر فایل توسط سرور تلگرام برگردانده نشد.");
 
-    const absoluteFilePath = path.isAbsolute(fileObj.file_path)
+    absoluteFilePath = path.isAbsolute(fileObj.file_path)
       ? fileObj.file_path
       : path.join(LOCAL_FILES_DIR, TELEGRAM_BOT_TOKEN, fileObj.file_path);
 
     if (!fs.existsSync(absoluteFilePath))
       throw new Error(`فایل در مسیر مورد نظر یافت نشد: ${absoluteFilePath}`);
 
-    const totalBytes   = fs.statSync(absoluteFilePath).size;
+    const totalBytes = fs.statSync(absoluteFilePath).size;
     const fileSizeInMB = (totalBytes / (1024 * 1024)).toFixed(2);
-    const totalMB      = (totalBytes / (1024 * 1024)).toFixed(1);
 
-    // Show initial progress bar
-    await bot.api.editMessageText(
-      ctx.chat.id, statusMsg.message_id,
-      `📤 در حال آپلود به پیکسل‌درین...\n\n[░░░░░░░░░░░░░░░░░░░░] 0%\n📊 0.0 / ${totalMB} MB\n⚡ سرعت: محاسبه...\n⏱ زمان باقیمانده: محاسبه...`
-    );
+    // ── Stage 0: show progress while Telegram finishes handing us the file ──
+    // (For most cases the local Bot API server has already saved it fully by
+    // the time we get here, so this resolves immediately; for very large files
+    // it gives real-time feedback instead of a frozen "در حال دریافت" message.)
+    await bot.api.editMessageText(ctx.chat.id, statusMsg.message_id, formatInitialProgress("در حال دریافت از تلگرام...", "📥", totalBytes));
 
-    // Rate-limited progress updater (max once per 2.5 sec)
-    let lastUpdate = 0;
-    const publicUrl = await uploadToPixeldrain(absoluteFilePath, fileName, totalBytes, (uploaded, total, speedBps) => {
-      const now = Date.now();
-      if (now - lastUpdate < 2500) return;
-      lastUpdate = now;
-      bot.api.editMessageText(ctx.chat.id, statusMsg.message_id, formatProgress(uploaded, total, speedBps))
-        .catch(() => {});
+    const reportDownload = makeThrottledProgress(2000, (uploaded, total, speed) => {
+      bot.api.editMessageText(ctx.chat.id, statusMsg.message_id, formatProgress("در حال دریافت از تلگرام...", "📥", uploaded, total, speed)).catch(() => {});
     });
 
-    // Cleanup local file
+    await waitForLocalFileWithProgress(absoluteFilePath, totalBytes, reportDownload);
+
+    // ── Stage 1..N: upload to every configured destination, one at a time ──
+    const results: { service: UploaderService; url?: string; error?: string }[] = [];
+
+    for (const service of services) {
+      await bot.api.editMessageText(
+        ctx.chat.id,
+        statusMsg.message_id,
+        formatInitialProgress(`در حال آپلود به ${service.label}...`, service.emoji, totalBytes)
+      ).catch(() => {});
+
+      const reportUpload = makeThrottledProgress(2000, (uploaded, total, speed) => {
+        bot.api.editMessageText(
+          ctx.chat.id,
+          statusMsg.message_id,
+          formatProgress(`در حال آپلود به ${service.label}...`, service.emoji, uploaded, total, speed)
+        ).catch(() => {});
+      });
+
+      try {
+        const url = await service.upload(absoluteFilePath, fileName, mimeType, totalBytes, reportUpload);
+        results.push({ service, url });
+      } catch (error: any) {
+        console.error(`Upload error [${service.label}]:`, error);
+        results.push({ service, error: error?.message || String(error) });
+      }
+    }
+
+    // Cleanup local file once all uploads have finished (success or failure).
     try { fs.unlinkSync(absoluteFilePath); } catch {}
 
-    await bot.api.editMessageText(
-      ctx.chat.id, statusMsg.message_id,
+    const successLines = results
+      .filter((r) => r.url)
+      .map((r) => `${r.service.emoji} ${r.service.label}:\n${r.url}`);
+    const failureLines = results
+      .filter((r) => r.error)
+      .map((r) => `${r.service.emoji} ${r.service.label}: ❌ ${r.error}`);
+
+    if (successLines.length === 0) {
+      await bot.api.editMessageText(
+        ctx.chat.id,
+        statusMsg.message_id,
+        `❌ آپلود فایل در همه‌ی سرویس‌ها ناموفق بود:\n\n${failureLines.join("\n")}`
+      );
+      return;
+    }
+
+    let finalText =
       `✅ فایل با موفقیت آپلود شد!\n\n` +
       `📦 نام فایل: ${fileName}\n` +
       `💾 حجم فایل: ${fileSizeInMB} MB\n\n` +
-      `🔗 لینک دانلود مستقیم:\n${publicUrl}`,
-      { link_preview_options: { is_disabled: true } }
-    );
+      `🔗 لینک‌های دانلود مستقیم:\n\n` +
+      successLines.join("\n\n");
 
+    if (failureLines.length > 0) {
+      finalText += `\n\n⚠️ آپلود ناموفق در:\n${failureLines.join("\n")}`;
+    }
+
+    await bot.api.editMessageText(ctx.chat.id, statusMsg.message_id, finalText, {
+      link_preview_options: { is_disabled: true }
+    });
   } catch (error: any) {
     console.error("Upload error:", error);
+    if (absoluteFilePath) {
+      try { fs.unlinkSync(absoluteFilePath); } catch {}
+    }
     await bot.api.editMessageText(
       ctx.chat.id, statusMsg.message_id,
       `❌ خطا در انجام فرآیند آپلود:\n${error.message || error}`
@@ -196,5 +203,5 @@ bot.on([":document", ":photo", ":video", ":audio", ":voice", ":video_note", ":an
 });
 
 bot.start();
-console.log("Telegram Pixeldrain Uploader Bot Daemon started.");
-
+console.log("Telegram Multi-Host Uploader Bot Daemon started.");
+console.log(`Active services: ${services.map((s) => s.label).join(", ")}`);
