@@ -1,0 +1,6 @@
+node_modules/
+dist/
+.env
+build_output.txt
+memory/
+*.log
