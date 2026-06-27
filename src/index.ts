@@ -101,22 +101,22 @@ function uploadToPixeldrain(filePath: string, fileName: string): Promise<string>
     const url = `https://pixeldrain.com/api/file/${encodedFileName}`;
 
     const parsedUrl = new URL(url);
-    const options: https.RequestOptions = {
-      method: "PUT",
-      hostname: parsedUrl.hostname,
-      path: parsedUrl.pathname,
-      headers: {
-        "User-Agent": "telegram-uploader-bot/1.0"
-      }
+    const headers: Record<string, string> = {
+      "User-Agent": "telegram-uploader-bot/1.0"
     };
 
     // If api key is provided, use basic auth with empty username and key as password
     if (PIXELDRAIN_API_KEY) {
       const auth = Buffer.from(`:${PIXELDRAIN_API_KEY}`).toString("base64");
-      if (options.headers) {
-        options.headers["Authorization"] = `Basic ${auth}`;
-      }
+      headers["Authorization"] = `Basic ${auth}`;
     }
+
+    const options: https.RequestOptions = {
+      method: "PUT",
+      hostname: parsedUrl.hostname,
+      path: parsedUrl.pathname,
+      headers
+    };
 
     const req = https.request(options, (res) => {
       let responseBody = "";
