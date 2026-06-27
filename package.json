@@ -1,7 +1,7 @@
 {
-  "name": "telegram-r2-uploader",
+  "name": "telegram-multi-uploader",
   "version": "1.0.0",
-  "description": "Telegram bot for uploading up to 2GB files to Cloudflare R2 using local Bot API server",
+  "description": "Telegram bot for uploading up to 2GB files to Pixeldrain, GoFile, and storage.to using a local Bot API server",
   "main": "dist/index.js",
   "private": true,
   "scripts": {
