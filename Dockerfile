@@ -27,5 +27,8 @@ RUN chmod +x start.sh
 # Expose port (Internal Local API server runs on 8081)
 EXPOSE 8081
 
+# Reset base image ENTRYPOINT so our start.sh runs correctly
+ENTRYPOINT []
+
 # Execute startup setup
 CMD ["./start.sh"]
